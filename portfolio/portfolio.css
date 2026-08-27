@@ -430,6 +430,7 @@ section {
   padding: 1.5rem;
   text-align: center;
   transition: transform 0.3s ease, box-shadow 0.3s ease;
+  cursor: pointer;
 }
 
 .certificates-card:hover {
