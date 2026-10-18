@@ -28,7 +28,11 @@
       };
 
       this.activeUtterance = null;
-      this.watchdogTimer = null;
+      this.sessionId = 0;
+      this.currentSegments = [];
+      this.currentSegmentIndex = 0;
+      this.segmentTimeout = null;
+      this.stallTimer = null;
       this.autoplayCheckTimer = null;
       this.welcomeAutoplayAttempted = false;
       this.listeners = new Set();
@@ -129,24 +133,85 @@
       });
     }
 
-    startWatchdog() {
-      this.stopWatchdog();
-      // Prevents Chrome Web Speech timeout/garbage collection pause on longer paragraphs
-      this.watchdogTimer = setInterval(() => {
-        if (this.synth && this.synth.speaking && !this.synth.paused) {
-          try {
-            this.synth.pause();
-            this.synth.resume();
-          } catch (e) {}
+    /**
+     * Splits long narration text into natural segments at sentence boundaries (. ! ?).
+     * Prevents browser speech synthesis 15-second timeouts, network TTS dropouts, and audio buffering freezes.
+     * If a single sentence exceeds maxChars, it cleanly subdivides at clause delimiters (, ; :) or word boundaries.
+     */
+    splitTextIntoSegments(text, maxChars = 160) {
+      if (!text || typeof text !== 'string') return [];
+      const rawSegments = text.match(/[^.!?]+[.!?]+(?:\s+|$)|[^.!?]+$/g) || [text];
+      const segments = [];
+
+      for (const raw of rawSegments) {
+        const trimmed = raw.trim();
+        if (!trimmed) continue;
+
+        if (trimmed.length > maxChars) {
+          const clauseMatches = trimmed.match(/[^,;:]+[,;:]+(?:\s+|$)|[^,;:]+$/g);
+          if (clauseMatches && clauseMatches.length > 1) {
+            let buffer = '';
+            for (const clause of clauseMatches) {
+              const cTrim = clause.trim();
+              if (!cTrim) continue;
+              if (buffer && (buffer.length + cTrim.length + 1 > maxChars)) {
+                segments.push(buffer);
+                buffer = cTrim;
+              } else {
+                buffer = buffer ? buffer + ' ' + cTrim : cTrim;
+              }
+            }
+            if (buffer) segments.push(buffer);
+          } else {
+            const words = trimmed.split(/\s+/);
+            let buffer = '';
+            for (const w of words) {
+              if (buffer && (buffer.length + w.length + 1 > maxChars)) {
+                segments.push(buffer);
+                buffer = w;
+              } else {
+                buffer = buffer ? buffer + ' ' + w : w;
+              }
+            }
+            if (buffer) segments.push(buffer);
+          }
+        } else {
+          segments.push(trimmed);
         }
-      }, 10000);
+      }
+      return segments.length > 0 ? segments : [text.trim()];
     }
 
-    stopWatchdog() {
-      if (this.watchdogTimer) {
-        clearInterval(this.watchdogTimer);
-        this.watchdogTimer = null;
+    clearAllTimers() {
+      if (this.segmentTimeout) {
+        clearTimeout(this.segmentTimeout);
+        this.segmentTimeout = null;
       }
+      this.clearStallTimer();
+      if (this.autoplayCheckTimer) {
+        clearTimeout(this.autoplayCheckTimer);
+        this.autoplayCheckTimer = null;
+      }
+    }
+
+    clearStallTimer() {
+      if (this.stallTimer) {
+        clearTimeout(this.stallTimer);
+        this.stallTimer = null;
+      }
+    }
+
+    startStallTimer(segmentText, index, sessionId) {
+      this.clearStallTimer();
+      // Estimated max speaking time for a short sentence (<160 chars) with generous safety margin
+      const safeRate = Math.max(0.7, this.state.rate || 1.0);
+      const estimatedMs = Math.max(9000, Math.ceil((segmentText.length / 7) * (1 / safeRate) * 1000) + 7000);
+
+      this.stallTimer = setTimeout(() => {
+        if (sessionId !== this.sessionId || this.state.status !== 'playing') return;
+        console.warn(`[VoiceController] Speech stall detected on segment ${index} for "${this.state.currentTrack?.id}". Recovering...`);
+        this.onSegmentEnd(index, sessionId);
+      }, estimatedMs);
     }
 
     /**
@@ -188,8 +253,8 @@
         return;
       }
 
-      // If already playing the SAME track, toggle pause/resume (unless autoplay attempt)
-      if (!isAutoplay && this.state.currentTrack && this.state.currentTrack.id === trackId) {
+      // If already playing the SAME track, toggle pause/resume (unless autoplay attempt or forced restart)
+      if (!isAutoplay && !options.forceRestart && this.state.currentTrack && this.state.currentTrack.id === trackId) {
         if (this.state.status === 'playing') {
           this.pause();
           return;
@@ -200,132 +265,222 @@
       }
 
       // Single shared speech controller: STOP any previous active speech immediately.
-      // If welcome was playing and a project button is clicked, welcome stops first!
       this.stop(false);
 
-      if (this.autoplayCheckTimer) {
-        clearTimeout(this.autoplayCheckTimer);
-        this.autoplayCheckTimer = null;
+      const currentSession = ++this.sessionId;
+      const segments = this.splitTextIntoSegments(narrationText);
+      this.currentSegments = segments;
+      this.currentSegmentIndex = options.startSegmentIndex || 0;
+      this.state.currentTrack = trackData;
+      this.state.status = 'idle';
+
+      // Small delay to let browser audio pipeline settle following cancel()
+      setTimeout(() => {
+        if (currentSession !== this.sessionId) return;
+        this.playSegment(this.currentSegmentIndex, isAutoplay);
+      }, 40);
+    }
+
+    playSegment(index, isAutoplay = false) {
+      if (!this.isSupported || !this.synth) return;
+      const sessionId = this.sessionId;
+
+      if (index >= this.currentSegments.length) {
+        // All segments finished successfully
+        this.state.status = 'completed';
+        this.activeUtterance = null;
+        if (window.__portfolioUtterances) window.__portfolioUtterances.clear();
+        window.__portfolioActiveUtterance = null;
+        this.clearAllTimers();
+        this.notify('end', { track: this.state.currentTrack });
+        return;
       }
 
-      setTimeout(() => {
-        try {
-          const utterance = new SpeechSynthesisUtterance(narrationText);
-          const voice = this.getSelectedVoice();
-          if (voice) utterance.voice = voice;
+      this.currentSegmentIndex = index;
+      const segmentText = this.currentSegments[index];
 
-          utterance.rate = Math.max(0.7, Math.min(1.6, this.state.rate));
-          utterance.pitch = Math.max(0.7, Math.min(1.3, this.state.pitch));
-          utterance.volume = this.state.isMuted ? 0 : 1;
+      try {
+        const utterance = new SpeechSynthesisUtterance(segmentText);
+        const voice = this.getSelectedVoice();
+        if (voice) utterance.voice = voice;
 
-          this.state.currentTrack = trackData;
-          this.activeUtterance = utterance;
-          window.__portfolioActiveUtterance = utterance; // Prevent garbage collection
+        utterance.rate = Math.max(0.7, Math.min(1.6, this.state.rate));
+        utterance.pitch = Math.max(0.7, Math.min(1.3, this.state.pitch));
+        utterance.volume = this.state.isMuted ? 0 : 1;
 
-          utterance.onstart = () => {
-            if (this.autoplayCheckTimer) {
-              clearTimeout(this.autoplayCheckTimer);
-              this.autoplayCheckTimer = null;
-            }
-            this.state.status = 'playing';
-            this.state.autoplayBlocked = false;
-            if (trackId === 'welcome') {
-              this.state.welcomeStartedOnce = true;
-            }
-            this.startWatchdog();
-            this.notify('start', { track: trackData });
-          };
+        utterance._sessionId = sessionId;
+        utterance._segmentIndex = index;
+        utterance._hasEnded = false;
 
-          utterance.onpause = () => {
-            this.state.status = 'paused';
-            this.stopWatchdog();
-            this.notify('pause', { track: trackData });
-          };
+        this.activeUtterance = utterance;
+        window.__portfolioActiveUtterance = utterance;
+        if (!window.__portfolioUtterances) {
+          window.__portfolioUtterances = new Set();
+        }
+        window.__portfolioUtterances.add(utterance);
 
-          utterance.onresume = () => {
-            this.state.status = 'playing';
-            this.startWatchdog();
-            this.notify('resume', { track: trackData });
-          };
+        utterance.onstart = () => {
+          if (utterance._sessionId !== this.sessionId || utterance._hasEnded) return;
 
-          utterance.onend = () => {
-            this.state.status = 'completed';
-            this.stopWatchdog();
-            this.activeUtterance = null;
-            window.__portfolioActiveUtterance = null;
-            this.notify('end', { track: trackData });
-          };
-
-          utterance.onerror = (e) => {
-            if (this.autoplayCheckTimer) {
-              clearTimeout(this.autoplayCheckTimer);
-              this.autoplayCheckTimer = null;
-            }
-            this.stopWatchdog();
-            this.activeUtterance = null;
-            window.__portfolioActiveUtterance = null;
-
-            if (e.error === 'canceled' || e.error === 'interrupted') {
-              this.state.status = 'stopped';
-              this.notify('stop', { track: trackData });
-            } else if (e.error === 'not-allowed' || isAutoplay) {
-              console.info('[VoiceController] Autoplay restricted by browser policy. Displaying "Play Welcome Message" button.');
-              this.state.status = 'idle';
-              this.state.autoplayBlocked = true;
-              this.notify('autoplayblocked', { track: trackData });
-            } else {
-              console.warn('[VoiceController] Speech synthesis error:', e.error);
-              this.state.status = 'error';
-              this.notify('error', { error: e.error, track: trackData });
-            }
-          };
-
-          if (isAutoplay) {
-            // In Chromium, if speech is blocked on load without a user gesture,
-            // speak() may remain pending indefinitely without firing onerror.
-            // We check within 650ms if onstart fired; if not, show "Play Welcome Message".
-            this.autoplayCheckTimer = setTimeout(() => {
-              if (this.state.status !== 'playing' && !this.state.welcomeStartedOnce) {
-                try { this.synth.cancel(); } catch (e) {}
-                this.state.status = 'idle';
-                this.state.autoplayBlocked = true;
-                this.notify('autoplayblocked', { track: trackData });
-              }
-            }, 650);
+          if (this.autoplayCheckTimer) {
+            clearTimeout(this.autoplayCheckTimer);
+            this.autoplayCheckTimer = null;
           }
 
-          this.synth.speak(utterance);
-        } catch (err) {
-          console.error('[VoiceController] Failed to play utterance:', err);
-          if (isAutoplay) {
+          this.state.status = 'playing';
+          this.state.autoplayBlocked = false;
+          if (this.state.currentTrack && this.state.currentTrack.id === 'welcome') {
+            this.state.welcomeStartedOnce = true;
+          }
+
+          this.startStallTimer(segmentText, index, sessionId);
+
+          if (index === 0) {
+            this.notify('start', { track: this.state.currentTrack });
+          } else {
+            this.notify('segmentstart', { track: this.state.currentTrack, segmentIndex: index });
+          }
+        };
+
+        utterance.onpause = () => {
+          if (utterance._sessionId !== this.sessionId) return;
+          this.state.status = 'paused';
+          this.clearStallTimer();
+          this.notify('pause', { track: this.state.currentTrack });
+        };
+
+        utterance.onresume = () => {
+          if (utterance._sessionId !== this.sessionId) return;
+          this.state.status = 'playing';
+          this.startStallTimer(segmentText, index, sessionId);
+          this.notify('resume', { track: this.state.currentTrack });
+        };
+
+        utterance.onend = () => {
+          utterance._hasEnded = true;
+          if (utterance._sessionId !== this.sessionId) return;
+          this.clearStallTimer();
+          if (window.__portfolioUtterances) {
+            window.__portfolioUtterances.delete(utterance);
+          }
+          this.onSegmentEnd(index, sessionId, isAutoplay);
+        };
+
+        utterance.onerror = (e) => {
+          utterance._hasEnded = true;
+          if (utterance._sessionId !== this.sessionId) return;
+          this.clearStallTimer();
+          if (window.__portfolioUtterances) {
+            window.__portfolioUtterances.delete(utterance);
+          }
+
+          console.warn(`[VoiceController] Speech error on segment ${index} (${e.error}) for track:`, this.state.currentTrack?.id);
+
+          if (e.error === 'canceled' || e.error === 'interrupted') {
+            this.state.status = 'stopped';
+            this.notify('stop', { track: this.state.currentTrack });
+          } else if (e.error === 'not-allowed' || isAutoplay) {
+            console.info('[VoiceController] Autoplay restricted by browser policy. Displaying "Play Welcome Message" button.');
             this.state.status = 'idle';
             this.state.autoplayBlocked = true;
-            this.notify('autoplayblocked', { track: trackData });
+            this.notify('autoplayblocked', { track: this.state.currentTrack });
           } else {
+            console.error('[VoiceController] Speech synthesis error:', e.error);
             this.state.status = 'error';
-            this.notify('error', { error: err.message, track: trackData });
+            this.notify('error', { error: e.error, track: this.state.currentTrack });
           }
+        };
+
+        if (isAutoplay && index === 0) {
+          // Allow up to 900ms for browser to start autoplay before marking blocked
+          this.autoplayCheckTimer = setTimeout(() => {
+            if (this.state.status !== 'playing' && !this.state.welcomeStartedOnce) {
+              try { this.synth.cancel(); } catch (e) {}
+              this.state.status = 'idle';
+              this.state.autoplayBlocked = true;
+              this.notify('autoplayblocked', { track: this.state.currentTrack });
+            }
+          }, 900);
         }
-      }, 50);
+
+        this.synth.speak(utterance);
+      } catch (err) {
+        console.error('[VoiceController] Failed to play utterance segment:', err);
+        if (isAutoplay) {
+          this.state.status = 'idle';
+          this.state.autoplayBlocked = true;
+          this.notify('autoplayblocked', { track: this.state.currentTrack });
+        } else {
+          this.state.status = 'error';
+          this.notify('error', { error: err.message, track: this.state.currentTrack });
+        }
+      }
+    }
+
+    onSegmentEnd(index, sessionId, isAutoplay = false) {
+      if (sessionId !== this.sessionId) return;
+      if (this.state.status === 'stopped' || this.state.status === 'error') return;
+
+      const nextIndex = index + 1;
+      if (nextIndex < this.currentSegments.length) {
+        // Sequential progression: short gap between sentences for human-like cadence
+        this.segmentTimeout = setTimeout(() => {
+          if (sessionId !== this.sessionId) return;
+          this.playSegment(nextIndex, isAutoplay);
+        }, 25);
+      } else {
+        // Complete narration finished
+        this.state.status = 'completed';
+        this.activeUtterance = null;
+        if (window.__portfolioUtterances) window.__portfolioUtterances.clear();
+        window.__portfolioActiveUtterance = null;
+        this.clearAllTimers();
+        this.notify('end', { track: this.state.currentTrack });
+      }
     }
 
     pause() {
       if (!this.isSupported || !this.synth) return;
-      if (this.synth.speaking && !this.synth.paused) {
-        this.synth.pause();
+      if (this.state.status === 'playing') {
+        this.clearStallTimer();
+        if (this.segmentTimeout) {
+          clearTimeout(this.segmentTimeout);
+          this.segmentTimeout = null;
+        }
+        try {
+          this.synth.pause();
+        } catch (e) {
+          console.warn('[VoiceController] Pause error:', e);
+        }
         this.state.status = 'paused';
-        this.stopWatchdog();
-        this.notify('pause');
+        this.notify('pause', { track: this.state.currentTrack });
       }
     }
 
     resume() {
       if (!this.isSupported || !this.synth) return;
-      if (this.synth.paused) {
-        this.synth.resume();
+      if (this.state.status === 'paused') {
         this.state.status = 'playing';
-        this.startWatchdog();
-        this.notify('resume');
+        this.notify('resume', { track: this.state.currentTrack });
+
+        try {
+          if (this.synth.paused) {
+            this.synth.resume();
+          } else {
+            this.playSegment(this.currentSegmentIndex);
+          }
+        } catch (e) {
+          console.warn('[VoiceController] Resume error, replaying segment:', e);
+          this.playSegment(this.currentSegmentIndex);
+        }
+
+        // Chromium safeguard: if speech does not resume within 250ms, replay current segment
+        setTimeout(() => {
+          if (this.state.status === 'playing' && !this.synth.speaking && !this.synth.paused) {
+            console.info('[VoiceController] Resume did not restart audio, recovering segment:', this.currentSegmentIndex);
+            this.playSegment(this.currentSegmentIndex);
+          }
+        }, 250);
       } else if (this.state.currentTrack && (this.state.status === 'stopped' || this.state.status === 'completed')) {
         this.play(this.state.currentTrack.id);
       }
@@ -333,27 +488,32 @@
 
     stop(notifyUser = true) {
       if (!this.isSupported || !this.synth) return;
-      this.stopWatchdog();
-      if (this.autoplayCheckTimer) {
-        clearTimeout(this.autoplayCheckTimer);
-        this.autoplayCheckTimer = null;
-      }
+      this.sessionId++; // Immediately invalidate any in-flight utterance callbacks
+      this.clearAllTimers();
+
       try {
         this.synth.cancel();
-      } catch (e) {}
+      } catch (e) {
+        console.warn('[VoiceController] Cancel error:', e);
+      }
 
       this.activeUtterance = null;
+      if (window.__portfolioUtterances) {
+        window.__portfolioUtterances.clear();
+      }
       window.__portfolioActiveUtterance = null;
+      this.currentSegments = [];
+      this.currentSegmentIndex = 0;
       this.state.status = 'stopped';
 
       if (notifyUser) {
-        this.notify('stop');
+        this.notify('stop', { track: this.state.currentTrack });
       }
     }
 
     replay() {
       if (this.state.currentTrack) {
-        this.play(this.state.currentTrack.id);
+        this.play(this.state.currentTrack.id, null, { forceRestart: true });
       }
     }
 
@@ -362,8 +522,9 @@
       if (this.isSupported && this.synth) {
         if (this.state.status === 'playing' && this.state.currentTrack) {
           const wasPlaying = this.state.currentTrack.id;
+          const currentSeg = this.currentSegmentIndex;
           this.stop(false);
-          this.play(wasPlaying);
+          this.play(wasPlaying, null, { startSegmentIndex: currentSeg, forceRestart: true });
         }
       }
       this.notify('mute', { isMuted: this.state.isMuted });
@@ -583,6 +744,8 @@
           voiceWelcomeStatus.textContent = 'Click "Play Welcome Message" to start audio';
         } else if (isSpeaking && state.currentTrack) {
           voiceWelcomeStatus.textContent = `Narrating: ${state.currentTrack.title}`;
+        } else if (state.status === 'error') {
+          voiceWelcomeStatus.textContent = 'Audio playback error • Click Play to retry';
         } else if (state.welcomeStartedOnce) {
           voiceWelcomeStatus.textContent = 'Voice Experience Active • Ready';
         } else {
@@ -608,6 +771,8 @@
         const card = btn.closest('.project-card');
         const isCurrent = currentId === projectId;
         const textSpan = btn.querySelector('.voice-btn-text');
+        const badge = card ? card.querySelector('.project-voice-badge') : null;
+        const badgeText = badge ? badge.querySelector('span:last-child') : null;
 
         if (isCurrent && isSpeaking) {
           btn.classList.add('playing');
@@ -617,6 +782,7 @@
             card.classList.add('is-speaking');
             card.classList.remove('is-paused');
           }
+          if (badgeText) badgeText.textContent = 'Speaking';
         } else if (isCurrent && isPaused) {
           btn.classList.add('paused');
           btn.classList.remove('playing');
@@ -625,6 +791,7 @@
             card.classList.add('is-paused');
             card.classList.remove('is-speaking');
           }
+          if (badgeText) badgeText.textContent = 'Paused';
         } else if (isCurrent && isCompleted) {
           btn.classList.remove('playing', 'paused');
           if (textSpan) textSpan.textContent = 'Replay Voice';
@@ -662,6 +829,10 @@
               playerTrackStatus.textContent = 'Narration paused';
             } else if (isCompleted) {
               playerTrackStatus.textContent = 'Narration finished • Ready to replay';
+            } else if (state.status === 'error') {
+              playerTrackStatus.textContent = 'Playback error • Ready to retry';
+            } else if (state.status === 'stopped') {
+              playerTrackStatus.textContent = 'Narration stopped • Ready to play';
             } else {
               playerTrackStatus.textContent = state.currentTrack.subtitle || 'Audio ready';
             }
